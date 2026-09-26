@@ -3,7 +3,7 @@
 /**
  * Watch mode — what someone who opens a shared link gets (read-only).
  *
- * - <WatchFeed>: subscribes to /api/watch/<gameId>/feed (this game's crew
+ * - <WatchFeed>: polls /api/watch/<gameId>/poll (this game's crew
  *   sessions only) and puts every event on the live bus, so the rooms' ops
  *   terminals mirror the host's real TrueForge sessions as they happen.
  * - <WatchSystemView>: System View for viewers — the live, read-only session
@@ -29,49 +29,47 @@ export function WatchFeed({ gameId, sessions }: { gameId: string; sessions: Watc
   labels.current = new Map(sessions.map((s) => [s.sessionId, `${s.npcName} (${s.agentType.name})`]));
   const seq = useRef(0);
 
+  // Poll the read-only snapshot (Cloudflare quick tunnels don't deliver
+  // Server-Sent Events) and publish only events not seen yet, per turn.
+  const seen = useRef(new Map<string, number>());
   useEffect(() => {
-    const ctrl = new AbortController();
-    (async () => {
-      for (let attempt = 0; !ctrl.signal.aborted && attempt < 50; attempt++) {
-        try {
-          const res = await fetch(`/api/watch/${gameId}/feed`, { signal: ctrl.signal });
-          if (!res.ok || !res.body) throw new Error(`feed ${res.status}`);
-          const reader = res.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = "";
-          for (;;) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            let sep: number;
-            while ((sep = buffer.indexOf("\n\n")) >= 0) {
-              const chunk = buffer.slice(0, sep);
-              buffer = buffer.slice(sep + 2);
-              if (!chunk.startsWith("data:")) continue;
-              const { sessionId, event } = JSON.parse(chunk.slice(5).trimStart()) as {
-                sessionId: string;
-                history?: boolean;
-                event: TFEvent | { type: "history_end" };
-              };
-              if (event.type === "history_end") continue;
-              // WORKING while a turn streams; IDLE once it is done.
-              setAgentActive(sessionId, event.type !== "done");
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(`/api/watch/${gameId}/poll`, { cache: "no-store" });
+        if (!res.ok) return;
+        const { sessions: snap } = (await res.json()) as {
+          sessions: { sessionId: string; turns: { turnId: string; running: boolean; events: TFEvent[] }[] }[];
+        };
+        for (const s of snap) {
+          const last = s.turns.at(-1);
+          setAgentActive(s.sessionId, Boolean(last?.running));
+          for (const t of s.turns) {
+            const from = seen.current.get(t.turnId) ?? 0;
+            for (const event of t.events.slice(from)) {
               publishAgent({
-                ...(event as TFEvent),
-                id: `watch-${Date.now()}-${seq.current++}`,
+                ...event,
+                id: `watch-${t.turnId}-${seq.current++}`,
                 timestamp: new Date().toISOString(),
-                sessionId,
-                agent: labels.current.get(sessionId) ?? "crew",
+                sessionId: s.sessionId,
+                agent: labels.current.get(s.sessionId) ?? "crew",
               } as AgentFeedEvent);
             }
+            seen.current.set(t.turnId, Math.max(from, t.events.length));
           }
-        } catch {
-          if (ctrl.signal.aborted) return;
         }
-        await new Promise((r) => setTimeout(r, 3000)); // reconnect
+      } catch {}
+    };
+    const loop = async () => {
+      while (!stopped) {
+        await tick();
+        await new Promise((r) => setTimeout(r, 2000));
       }
-    })();
-    return () => ctrl.abort();
+    };
+    loop();
+    return () => {
+      stopped = true;
+    };
   }, [gameId]);
 
   return null;
@@ -98,7 +96,7 @@ export function WatchSystemView({ sessions, onClose }: { sessions: WatchSessionI
             agentName={s.npcName}
             typeName={`${s.agentType.name} · session ${s.sessionId.slice(-8)}`}
             mcpServers={[]}
-            memoryCount={0}
+
           />
         </div>
       ))}

@@ -1166,7 +1166,7 @@ export function World({ mode, gameId: routeGameId, initialIdea, initialCrew }: W
             showScene(interior);
             // The crew member's TrueForge session (usually provisioned at boot).
             const gameId = gameIdRef.current;
-            if (gameId && interior.npc && typeof h.clueIndex === "number") {
+            if (gameId && interior.npc && typeof h.clueIndex === "number" && !viewer) {
               provisionAgent(bible, gameId, h.clueIndex);
             }
           }

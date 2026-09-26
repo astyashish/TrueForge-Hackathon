@@ -38,7 +38,7 @@ export function viewerMayAccess(method: string, pathname: string): boolean {
   return (
     /^\/play\/[0-9a-f-]{36}\/?$/i.test(pathname) || // the shared world
     /^\/api\/games\/[0-9a-f-]{36}$/i.test(pathname) || // its saved world data
-    /^\/api\/watch\/[0-9a-f-]{36}\/(sessions|feed)$/i.test(pathname) || // read-only live mirror
+    /^\/api\/watch\/[0-9a-f-]{36}\/(sessions|poll)$/i.test(pathname) || // read-only live mirror
     pathname === "/shared" ||
     pathname.startsWith("/_next/") ||
     pathname === "/favicon.ico"

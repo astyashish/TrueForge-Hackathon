@@ -880,7 +880,9 @@ export async function* replayTurn(
   prevPending: TFEvent | null,
   signal: AbortSignal,
   /** Mark decisions as made in the TrueForge UI (true for the owner's watcher). */
-  fromTrueForgeUi = true
+  fromTrueForgeUi = true,
+  /** false: read stored events only (deterministic replay, for polling). */
+  live = true
 ): AsyncGenerator<TFEvent> {
   // What the Operator did to start this turn (from the turn's real input).
   for (const item of turn.input ?? []) {
@@ -921,8 +923,9 @@ export async function* replayTurn(
   let sawDone = false;
   let streamed = false;
   try {
-    const live = await client().sessions.subscribeToTurn(sessionId, turn.id, {}, { abortSignal: signal, timeoutInSeconds: 600 });
-    for await (const ev of live) {
+    if (!live) throw new Error("stored events only");
+    const stream = await client().sessions.subscribeToTurn(sessionId, turn.id, {}, { abortSignal: signal, timeoutInSeconds: 600 });
+    for await (const ev of stream) {
       streamed = true;
       for (const out of translator.push(ev)) {
         if (out.type === "done") sawDone = true;
@@ -940,7 +943,7 @@ export async function* replayTurn(
       }
     }
   }
-  if (!sawDone) yield { type: "done" };
+  if (!sawDone && turn.state.status !== "running") yield { type: "done" };
 }
 
 /**
