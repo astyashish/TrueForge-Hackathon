@@ -1,0 +1,33 @@
+/* Hallmark · tokens for Kahani World — the portable design system.
+ * Consumed via Tailwind v4 @theme inline in app/globals.css; kept here so the
+ * system can travel to another project. Warm editorial: terracotta on cream. */
+:root {
+  /* color */
+  --color-paper: #f6f0e6;
+  --color-surface: #fffdf8;
+  --color-ink: #2a201a;
+  --color-ink-soft: #7c6d61;
+  --color-accent: #c8552e; /* terracotta anchor */
+  --color-accent-2: #d98a3d; /* warm ochre */
+  --color-bold: #c04a2f;
+  --color-cautious: #4a7c88;
+  --color-cunning: #6d5f97;
+  --color-kind: #6b8e5a;
+  --color-health: #b34a44;
+  --color-clock: #6d5f97;
+  --color-rupees: #b3862f;
+  --color-karma: #4a7c88;
+
+  /* type */
+  --font-display: "Bricolage Grotesque", sans-serif;
+  --font-body: "Plus Jakarta Sans", system-ui, sans-serif;
+
+  /* motion */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-short: 220ms;
+
+  /* shape */
+  --radius-panel: 16px;
+  --radius-control: 8px;
+  --radius-pill: 999px;
+}

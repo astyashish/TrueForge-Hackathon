@@ -1,0 +1,1813 @@
+"use client";
+
+/**
+ * Explorable world orchestrator: generation, persistence, load/resume, and play.
+ *
+ * - **Create mode** (from Home): bible → game row → boot → incremental saves.
+ * - **Load mode** (`/play/[id]`): hydrate from Storage; owners may still generate.
+ * - **Visitors**: finite world — edges without saved neighbors act as walls.
+ */
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import posthog from "posthog-js";
+import { AnimatePresence, motion } from "framer-motion";
+import { Compass, DoorOpen, Zap } from "lucide-react";
+import type {
+  CreateGameResponse,
+  FinaleData,
+  FinaleOutcome,
+  FullGameResponse,
+  Premise,
+  WorldDialogueState,
+  WorldPhase,
+  WorldProps,
+} from "@/lib/types/client";
+import type {
+  DialogueResponse,
+  DialogueTurn,
+  GameBible,
+  Hotspot,
+  SceneData,
+} from "@/lib/universe";
+import { repairLoadedStreetEdges, streetCoordKeys } from "@/lib/screen-edges";
+import { GEN_CALL_COST, MAX_GAME_TITLE_LENGTH, SESSION_TIME_LIMIT_SEC } from "@/lib/constants";
+import { MusicEngine, getMusicTheme, pickMusicTheme } from "@/lib/music";
+import { playSfx } from "@/lib/sfx";
+import {
+  getCachedImage,
+  preloadSceneImages,
+  warmSceneImages,
+} from "@/lib/image-cache";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { BOOT_PROGRESS, LoadingBlock } from "@/components/LoadingBlock";
+import { GameCanvas, type ExitDirection, type PlayerState, type TouchInput } from "./GameCanvas";
+import { AgentDialogue, type ApprovalResolver } from "./AgentDialogue";
+import type { TFEvent } from "@/lib/trueforge";
+import { GenerationConsole } from "./GenerationConsole";
+import { OpsTerminal } from "./OpsTerminal";
+import { beginBoot, clientStage, endGroup, postStaged, startGroup } from "@/lib/live-bus";
+import { DEFAULT_CREW } from "@/lib/crew";
+import { DialogueBox } from "./DialogueBox";
+import { MobileControls, RotateToLandscapePrompt, useCoarsePointer } from "./MobileControls";
+import { WorldHud } from "./WorldHud";
+import { ThresholdCard, type ApprovalPayload } from "./ThresholdCard";
+import { SessionWatcher, SystemViewHost } from "./SystemViewHost";
+import { WatchBanner, WatchFeed, WatchSystemView, type WatchSessionInfo } from "./WatchMode";
+import { SharePopover } from "./SharePopover";
+import {
+  mergeKnownCell,
+  streetCellFromScene,
+  streetsFromScenes,
+  type MinimapCell,
+} from "./Minimap";
+
+export type { WorldProps };
+
+/** Blast Radius drawn by a reckless approval action. */
+const OFFENSE_HEAT = { none: 0, minor: 12, grave: 35 } as const;
+
+/** Walking off an edge: neighbor delta, spawn point on arrival, word shown. */
+const EDGE_META: Record<
+  ExitDirection,
+  { dx: number; dy: number; spawn: { x: number; y: number }; word: string }
+> = {
+  n: { dx: 0, dy: -1, spawn: { x: 50, y: 92 }, word: "north" },
+  e: { dx: 1, dy: 0, spawn: { x: 5, y: 70 }, word: "east" },
+  s: { dx: 0, dy: 1, spawn: { x: 50, y: 8 }, word: "south" },
+  w: { dx: -1, dy: 0, spawn: { x: 95, y: 70 }, word: "west" },
+};
+
+const ORIGIN_ID = "s0_0";
+
+/** Default opening dialogue options when approaching a district agent. */
+const OPENING_OPTIONS = [
+  "What have you found so far?",
+  "Show me the worst offenders.",
+  "Walk me through what you'd do next.",
+];
+
+/** Sarvam Bulbul delivery params derived from dialogue mood. */
+function voiceParams(mood?: string): { pace: number; temperature: number } {
+  switch (mood) {
+    case "urgent":
+    case "angry":
+      return { pace: 1.3, temperature: 0.9 };
+    case "fearful":
+    case "secretive":
+      return { pace: 0.85, temperature: 0.4 };
+    case "warm":
+    case "amused":
+      return { pace: 1.0, temperature: 0.6 };
+    case "wary":
+      return { pace: 0.95, temperature: 0.5 };
+    default:
+      return { pace: 1.0, temperature: 0.6 };
+  }
+}
+
+/** Narrator delivery for finale resolution lines. */
+const NARRATOR_VOICE = "shubh";
+const NARRATOR_PARAMS = { pace: 0.8, temperature: 0.5 };
+
+/** True when the value is an inline `data:` URL from live generation. */
+function isDataUrl(value: string): boolean {
+  return value.startsWith("data:");
+}
+
+/** True when the value is a remote URL (e.g. Supabase Storage). */
+function isRemoteUrl(value: string): boolean {
+  return value.startsWith("http://") || value.startsWith("https://");
+}
+
+/**
+ * Turn a white-background sprite into a transparent canvas for the game loop.
+ * Sets `crossOrigin` for Storage URLs so pixel data can be read.
+ */
+async function chromaKeySprite(src: string): Promise<HTMLCanvasElement> {
+  const img = new Image();
+  if (isRemoteUrl(src)) img.crossOrigin = "anonymous";
+  img.src = src;
+  await new Promise<void>((res, rej) => {
+    img.onload = () => res();
+    img.onerror = () => rej(new Error("sprite load failed"));
+  });
+  const c = document.createElement("canvas");
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  const ctx = c.getContext("2d")!;
+  ctx.drawImage(img, 0, 0);
+  const data = ctx.getImageData(0, 0, c.width, c.height);
+  const px = data.data;
+  for (let i = 0; i < px.length; i += 4) {
+    const r = px[i];
+    const g = px[i + 1];
+    const b = px[i + 2];
+    if (r > 232 && g > 232 && b > 232) {
+      px[i + 3] = 0;
+    } else if (r > 215 && g > 215 && b > 215) {
+      px[i + 3] = Math.round(px[i + 3] * 0.4);
+    }
+  }
+  ctx.putImageData(data, 0, 0);
+  return c;
+}
+
+async function request<T>(
+  url: string,
+  init?: RequestInit
+): Promise<T> {
+  const res = await fetch(url, init);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status}).`);
+  return data as T;
+}
+
+/** JSON fetch helper for generation APIs (`POST`). */
+async function post<T>(url: string, body: unknown): Promise<T> {
+  return request<T>(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+/** JSON fetch helper for persistence APIs (`PUT`). */
+async function put<T>(url: string, body: unknown): Promise<T> {
+  return request<T>(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+/** Strip the `data:…;base64,` prefix for Gemini continuity payloads. */
+function stripDataUrl(dataUrl: string): string {
+  const comma = dataUrl.indexOf(",");
+  return comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+}
+
+/** Build `/api/screen` continuity fields from inline or Storage neighbor images. */
+function prevScreenPayload(prevScene: SceneData | null) {
+  if (!prevScene) return { prevImage: null as string | null, prevImageUrl: null as string | null };
+  if (isDataUrl(prevScene.image)) {
+    return { prevImage: stripDataUrl(prevScene.image), prevImageUrl: null };
+  }
+  return { prevImage: null, prevImageUrl: prevScene.image };
+}
+
+/** Build `/api/sprite` reference frame fields from inline or Storage origin image. */
+function spriteReferencePayload(reference: string | null) {
+  if (!reference) return { referenceFrame: null as string | null, referenceFrameUrl: null as string | null };
+  if (isDataUrl(reference)) {
+    return { referenceFrame: stripDataUrl(reference), referenceFrameUrl: null };
+  }
+  return { referenceFrame: null, referenceFrameUrl: reference };
+}
+
+/** Scan saved street scenes to learn which bible rooms are already placed. */
+function rebuildPlacedRooms(scenes: Iterable<SceneData>): Set<number> {
+  const placed = new Set<number>();
+  for (const s of scenes) {
+    if (s.kind !== "street") continue;
+    for (const h of s.hotspots) {
+      if (h.kind === "building" && typeof h.clueIndex === "number") {
+        placed.add(h.clueIndex);
+      }
+    }
+  }
+  return placed;
+}
+
+/**
+ * Reserve the next unplaced bible room before a screen POST begins.
+ * Parallel neighbor generation used to read the same unplaced list and duplicate rooms.
+ */
+function claimNextRoom(placed: Set<number>): number | null {
+  for (const i of [0, 1, 2] as const) {
+    if (!placed.has(i)) {
+      placed.add(i);
+      return i;
+    }
+  }
+  return null;
+}
+
+/** A crew member's live TrueForge session (POST /api/agent/session result). */
+type AgentSessionState = {
+  sessionId: string;
+  gameId: string;
+  npcName: string;
+  created: boolean;
+  pendingApproval: TFEvent | null;
+  agentType: { id: string; name: string; role: string; approvalTools: string[] };
+  mcpServers: { name: string; tools: number; ok: boolean }[];
+  /** Memory notes loaded into the session (unknown for viewers). */
+  memoryCount?: number;
+  /** Saved TrueForge agent this session was created from. */
+  agentName?: string;
+  /** Deep links into TrueForge's own UI (:8790). */
+  links?: { agent?: string; session?: string };
+};
+
+/**
+ * Main explorable world component.
+ * @param props.mode - `"create"` starts fresh; `"load"` hydrates a saved game.
+ * @param props.gameId - Required for load mode (`/play/[gameId]`).
+ * @param props.initialIdea - Required for create mode (passed from Home).
+ */
+export function World({ mode, gameId: routeGameId, initialIdea, initialCrew }: WorldProps) {
+  const router = useRouter();
+  /** Persisted game id — set after `POST /api/games` or on load. */
+  const gameIdRef = useRef<string | null>(routeGameId ?? null);
+  /** Owners may generate new scenes; visitors replay the finite saved world. */
+  const canGenerateRef = useRef(mode === "create");
+  /** Pre-saved finales from Storage (used on replay without regeneration). */
+  const savedFinalesRef = useRef<Partial<Record<FinaleOutcome, FinaleData>>>({});
+  const bootStartedRef = useRef(false);
+  const createStartedRef = useRef(false);
+
+  const [phase, setPhase] = useState<WorldPhase>("booting");
+  const [premise, setPremise] = useState<Premise | null>(null);
+  const [scene, setScene] = useState<SceneData | null>(null);
+  const [questHook, setQuestHook] = useState("");
+  const [bible, setBible] = useState<GameBible | null>(null);
+  const [cluesFound, setCluesFound] = useState<boolean[]>([false, false, false]);
+  const [heat, setHeat] = useState(0);
+  const [finale, setFinale] = useState<FinaleData | null>(null);
+  const [finaleLoading, setFinaleLoading] = useState(false);
+  const [inventory, setInventory] = useState<string[]>([]);
+  const [genCalls, setGenCalls] = useState(0);
+  const [interiorsReady, setInteriorsReady] = useState(0);
+  const addCalls = useCallback((n: number) => setGenCalls((c) => c + n), []);
+  const [sprite, setSprite] = useState<HTMLCanvasElement | null>(null);
+  const [bootStatus, setBootStatus] = useState("Loading your world…");
+  const [entering, setEntering] = useState<string | null>(null);
+  const [wandering, setWandering] = useState<string | null>(null);
+  /** Owner confirm before painting an unexplored overworld neighbor. */
+  const [pendingExplore, setPendingExplore] = useState<{
+    dir: ExitDirection;
+    word: string;
+    nx: number;
+    ny: number;
+    arriveAt: { x: number; y: number };
+  } | null>(null);
+  /** Brief overlay while a cached scene's Storage image finishes decoding. */
+  const [assetLoading, setAssetLoading] = useState<string | null>(null);
+  const [spawn, setSpawn] = useState<{ x: number; y: number } | null>(null);
+  const [showVision, setShowVision] = useState(false);
+  const [screensDreamed, setScreensDreamed] = useState(0);
+  const [ambient, setAmbient] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [voiceOn, setVoiceOn] = useState(true);
+  // Music preference persists across sessions; SSR renders no HUD, so the
+  // client-only lazy read cannot cause a hydration mismatch.
+  const [musicOn, setMusicOn] = useState(
+    () =>
+      typeof window === "undefined" ||
+      localStorage.getItem("threshold-music") !== "off"
+  );
+  const [speaking, setSpeaking] = useState(false);
+  const [dialogue, setDialogue] = useState<WorldDialogueState | null>(null);
+  const [playerPos, setPlayerPos] = useState<{ x: number; y: number } | null>(null);
+  const [knownStreets, setKnownStreets] = useState<MinimapCell[]>([]);
+  const [walkedStreets, setWalkedStreets] = useState<string[]>([]);
+  /** Discrete joystick axes for mobile movement. */
+  const touchInputRef = useRef<TouchInput>({ x: 0, y: 0 });
+  const [nearHotspot, setNearHotspot] = useState<Hotspot | null>(null);
+  const touchControls = useCoarsePointer();
+  /** Wall-clock session budget; resets each time the player enters a world. */
+  const [secondsLeft, setSecondsLeft] = useState(SESSION_TIME_LIMIT_SEC);
+
+  /** Pending Threshold Card approval payload (fires when TrueForge needs a checkpoint). */
+  const [pendingApproval, setPendingApproval] = useState<{
+    payload: ApprovalPayload;
+    resolve: ApprovalResolver;
+  } | null>(null);
+  const [approvalLoading, setApprovalLoading] = useState(false);
+  /**
+   * Live TrueForge sessions for the crew, keyed by interior scene id (b0-b2).
+   * A room without an entry falls back to static NPC dialogue.
+   */
+  const [agentSessions, setAgentSessions] = useState<Record<string, AgentSessionState>>({});
+  const agentPromises = useRef<Map<string, Promise<void>>>(new Map());
+  /** System View raw event feed (reads the live bus). */
+  const [systemViewOpen, setSystemViewOpen] = useState(false);
+  /** Opened through a shared link: read-only Watch mode (server decides; lib/access.ts). */
+  const [viewer, setViewer] = useState(false);
+  const [watchSessions, setWatchSessions] = useState<WatchSessionInfo[]>([]);
+  /** Full Generation Console shows groups from this boot onward. */
+  const [consoleSince, setConsoleSince] = useState(0);
+
+  /** Handle a Threshold Card decision (approve/deny). */
+  const handleApprovalDecision = useCallback(
+    async (decision: "approved" | "denied", reviewedDetail: boolean) => {
+      if (!pendingApproval) return;
+      setApprovalLoading(true);
+      try {
+        const { blastRadiusDelta } = await pendingApproval.resolve(decision, reviewedDetail);
+        if (blastRadiusDelta > 0) {
+          setHeat((v) => Math.min(100, v + blastRadiusDelta));
+        }
+        if (decision === "denied") {
+          setAmbient("Action denied — the agent holds its position.");
+          setTimeout(() => setAmbient(null), 4000);
+        } else {
+          setAmbient(reviewedDetail ? "Approved (detail reviewed — lower blast radius)." : "Approved.");
+          setTimeout(() => setAmbient(null), 3000);
+        }
+        setPendingApproval(null);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Couldn't reach TrueForge — try again.");
+        setTimeout(() => setError(null), 5000);
+      } finally {
+        setApprovalLoading(false);
+      }
+    },
+    [pendingApproval]
+  );
+
+  const scenesRef = useRef<Map<string, SceneData>>(new Map());
+  const interiorPromises = useRef<Map<string, Promise<SceneData>>>(new Map());
+  const screenPromises = useRef<Map<string, Promise<SceneData>>>(new Map());
+  const placedRoomsRef = useRef<Set<number>>(new Set());
+  const voiceCache = useRef<Map<string, Promise<string | null>>>(new Map());
+  const dialogueCache = useRef<Map<string, Promise<DialogueResponse>>>(new Map());
+  const finalePromise = useRef<Promise<FinaleData | null> | null>(null);
+  const defeatFinalePromise = useRef<Promise<FinaleData | null> | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const musicRef = useRef<MusicEngine | null>(null);
+  /** Last announced track id, the "now playing" toast fires once per theme. */
+  const musicThemeRef = useRef<string | null>(null);
+  const voiceOnRef = useRef(voiceOn);
+  voiceOnRef.current = voiceOn;
+  /** Fires the low-time ambient toast once per session. */
+  const lowTimeWarnedRef = useRef(false);
+
+  /**
+   * Theme-aware background music (see lib/music.ts): once the world is
+   * playable, pick a library theme from the premise/bible flavour text and
+   * loop it. Disposed on unmount so navigation kills the audio context.
+   */
+  useEffect(() => {
+    if (phase !== "playing" || !premise) return;
+    const engine = (musicRef.current ??= new MusicEngine());
+    // Newer bibles carry a model-chosen track (it read the player's idea,
+    // so it understands mood far better than keywords can). Older saved
+    // games fall back to keyword/hash matching over the bible text.
+    const theme =
+      getMusicTheme(bible?.musicTheme) ??
+      pickMusicTheme(
+        [
+          premise.title,
+          premise.setup,
+          premise.styleBible,
+          bible?.setting,
+          bible?.styleBible,
+          bible?.street?.description,
+          ...(bible?.rooms?.map((r) => `${r.name} ${r.description}`) ?? []),
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+    engine.start(theme);
+    engine.setMuted(!musicOn);
+    // Announce the track once so players can tell worlds apart by name.
+    if (musicThemeRef.current !== theme.id) {
+      musicThemeRef.current = theme.id;
+      console.debug(`[music] theme: ${theme.id} (${theme.label})`);
+      const note = `♪ ${theme.label}`;
+      setAmbient(note);
+      setTimeout(() => setAmbient((a) => (a === note ? null : a)), 5000);
+    }
+  }, [phase, premise, bible, musicOn]);
+
+  useEffect(() => () => musicRef.current?.dispose(), []);
+
+  // HUD toggle → mute; persists across sessions.
+  useEffect(() => {
+    musicRef.current?.setMuted(!musicOn);
+    localStorage.setItem("threshold-music", musicOn ? "on" : "off");
+  }, [musicOn]);
+
+  // The issue's one hard rule: music stops while the NPC is talking.
+  useEffect(() => {
+    musicRef.current?.setDucked(speaking);
+  }, [speaking]);
+
+  /**
+   * Game-event sound effects (issue #21). Watched centrally so every code
+   * path that changes these states gets the same feedback: found clues
+   * arpeggiate, errors buzz, conversations open/close. (Item pickups fire
+   * directly in `onInteract` — inferring them from inventory length missed
+   * actions that grant no item or re-grant a held one.)
+   */
+  const prevClueCount = useRef(0);
+  useEffect(() => {
+    const found = cluesFound.filter(Boolean).length;
+    const prev = prevClueCount.current;
+    prevClueCount.current = found;
+    if (phase === "playing" && found > prev) playSfx("success");
+  }, [cluesFound, phase]);
+  useEffect(() => {
+    if (phase === "playing" && error) playSfx("error");
+  }, [error, phase]);
+  const dialogueWasOpen = useRef(false);
+  useEffect(() => {
+    const open = !!dialogue;
+    const was = dialogueWasOpen.current;
+    dialogueWasOpen.current = open;
+    if (phase !== "playing" || open === was) return;
+    playSfx(open ? "open" : "close");
+  }, [dialogue, phase]);
+
+  /** Fire-and-forget persist of a generated scene to Storage + Postgres. */
+  /** Provision (or resume) the TrueForge session for the crew member in room `roomIndex`. */
+  const provisionAgent = useCallback((theBible: GameBible, gameId: string, roomIndex: number) => {
+    const districtId = `b${roomIndex}`;
+    if (agentPromises.current.has(districtId)) return;
+    const npc = theBible.npcs[roomIndex];
+    const agentTypeId = theBible.crew?.[roomIndex] ?? DEFAULT_CREW[roomIndex] ?? DEFAULT_CREW[0];
+    const p = postStaged<Omit<AgentSessionState, "gameId" | "npcName">>(
+      "/api/agent/session",
+      { gameId, districtId, agentTypeId, npcName: npc?.name },
+      `agent · ${npc?.name ?? "crew"} (${npc?.role ?? agentTypeId})`
+    )
+      .then((res) => {
+        setAgentSessions((prev) => ({
+          ...prev,
+          [districtId]: { ...res, gameId, npcName: npc?.name ?? res.agentType.name },
+        }));
+      })
+      .catch((err) => {
+        agentPromises.current.delete(districtId);
+        console.warn("[agent/session]", err);
+        setAmbient(`${npc?.name ?? "Agent"} offline — ${err instanceof Error ? err.message : "TrueForge unavailable"}`);
+        setTimeout(() => setAmbient(null), 6000);
+      });
+    agentPromises.current.set(districtId, p);
+  }, []);
+
+  const saveScene = useCallback((s: SceneData) => {
+    const id = gameIdRef.current;
+    if (!id || !canGenerateRef.current) return;
+    put(`/api/games/${id}/scenes/${s.id}`, s).catch(() => {});
+  }, []);
+
+  /** Fire-and-forget persist of the raw sprite render (before chroma-key). */
+  const saveSprite = useCallback((dataUrl: string) => {
+    const id = gameIdRef.current;
+    if (!id || !canGenerateRef.current) return;
+    put(`/api/games/${id}/sprite`, { sprite: dataUrl }).catch(() => {});
+  }, []);
+
+  /** Fire-and-forget persist of a generated finale image + copy. */
+  const saveFinale = useCallback((outcome: FinaleOutcome, f: FinaleData) => {
+    const id = gameIdRef.current;
+    if (!id || !canGenerateRef.current) return;
+    put(`/api/games/${id}/finales/${outcome}`, f).catch(() => {});
+  }, []);
+
+  const fetchVoice = useCallback(
+    (
+      text: string,
+      voice?: string,
+      pace?: number,
+      temperature?: number
+    ): Promise<string | null> => {
+      const key = `${voice ?? ""}|${pace ?? ""}|${temperature ?? ""}|${text}`;
+      const hit = voiceCache.current.get(key);
+      if (hit) return hit;
+      const p = post<{ audio: string | null }>("/api/voice", {
+        text,
+        voice,
+        pace,
+        temperature,
+      })
+        .then(({ audio }) => {
+          if (!audio) voiceCache.current.delete(key);
+          return audio;
+        })
+        .catch(() => {
+          voiceCache.current.delete(key);
+          return null;
+        });
+      voiceCache.current.set(key, p);
+      return p;
+    },
+    []
+  );
+
+  const speak = useCallback(
+    async (
+      text: string,
+      voice?: string,
+      pace?: number,
+      temperature?: number
+    ) => {
+      if (!voiceOnRef.current || !text.trim()) return;
+      const audio = await fetchVoice(text, voice, pace, temperature);
+      if (!audio || !voiceOnRef.current) return;
+      audioRef.current?.pause();
+      const el = new Audio(audio);
+      audioRef.current = el;
+      setSpeaking(true);
+      el.onended = () => setSpeaking(false);
+      el.onerror = () => setSpeaking(false);
+      await el.play().catch(() => setSpeaking(false));
+    },
+    [fetchVoice]
+  );
+
+  const stopVoice = useCallback(() => {
+    audioRef.current?.pause();
+    setSpeaking(false);
+  }, []);
+
+  const showScene = useCallback((s: SceneData) => {
+    let next = s;
+    if (s.kind === "street" && s.coord && s.edges) {
+      const repaired = repairLoadedStreetEdges(
+        s,
+        streetCoordKeys([...scenesRef.current.values()])
+      );
+      if (repaired && repaired !== s.edges) {
+        next = { ...s, edges: repaired };
+      }
+    }
+    scenesRef.current.set(next.id, next);
+    setScene(next);
+    setAmbient(next.ambient);
+    setTimeout(() => setAmbient((a) => (a === next.ambient ? null : a)), 5000);
+    warmSceneImages(next);
+
+    const cell = streetCellFromScene(next);
+    if (cell) {
+      setKnownStreets((prev) => mergeKnownCell(prev, cell));
+      const key = `${cell.x},${cell.y}`;
+      setWalkedStreets((prev) => (prev.includes(key) ? prev : [...prev, key]));
+    }
+  }, []);
+
+  /** Hold the current scene until backdrop images are decoded; optional overlay for cache hits. */
+  const ensureSceneReady = useCallback(
+    async (s: SceneData, loadingLabel?: string) => {
+      const needsOverlay = loadingLabel && !getCachedImage(s.image);
+      if (needsOverlay) setAssetLoading(loadingLabel);
+      try {
+        await preloadSceneImages(s);
+      } finally {
+        if (needsOverlay) setAssetLoading(null);
+      }
+    },
+    []
+  );
+
+  const prefetchConversation = useCallback(
+    (theBible: GameBible, s: SceneData) => {
+      if (!canGenerateRef.current) return;
+      const npc = s.npc;
+      if (!npc || typeof s.clueIndex !== "number") return;
+      const wary = voiceParams("wary");
+      fetchVoice(npc.opening, npc.voice, wary.pace, wary.temperature);
+      for (const option of OPENING_OPTIONS) {
+        const key = `${s.id}|${option}`;
+        if (dialogueCache.current.has(key)) continue;
+        const p = post<DialogueResponse>("/api/dialogue", {
+          bible: theBible,
+          npcIndex: s.clueIndex,
+          history: [{ speaker: "npc", text: npc.opening }],
+          playerLine: option,
+          clueFound: false,
+          exchanges: 1,
+          heat: 0,
+        }).then((reply) => {
+          const params = voiceParams(reply.mood);
+          fetchVoice(reply.line, npc.voice, params.pace, params.temperature);
+          return reply;
+        });
+        p.catch(() => dialogueCache.current.delete(key));
+        dialogueCache.current.set(key, p);
+      }
+    },
+    [fetchVoice]
+  );
+
+  const prefetchInterior = useCallback(
+    (theBible: GameBible, h: Hotspot, parentId: string) => {
+      if (typeof h.clueIndex !== "number") return;
+      const roomKey = `room${h.clueIndex}`;
+      const interiorId = `b${h.clueIndex}`;
+      const cached = scenesRef.current.get(interiorId);
+      if (cached) return;
+      if (!canGenerateRef.current) return;
+      if (interiorPromises.current.has(roomKey)) return;
+      const p = postStaged<{ scene: SceneData }>(
+        "/api/scene",
+        { bible: theBible, roomIndex: h.clueIndex, parentId },
+        `workstation · ${theBible.rooms[h.clueIndex]?.name ?? interiorId}`
+      ).then(({ scene: s }) => {
+        scenesRef.current.set(s.id, s);
+        addCalls(GEN_CALL_COST.interior);
+        setInteriorsReady((r) => r + 1);
+        saveScene(s);
+        warmSceneImages(s);
+        prefetchConversation(theBible, s);
+        return s;
+      });
+      p.catch(() => interiorPromises.current.delete(roomKey));
+      interiorPromises.current.set(roomKey, p);
+    },
+    [addCalls, prefetchConversation, saveScene]
+  );
+
+  /**
+   * Get-or-dream the screen at (x,y). Non-owners only receive cached scenes.
+   * Saves to Storage after each successful generation.
+   */
+  const ensureScreen = useCallback(
+    (
+      theBible: GameBible,
+      x: number,
+      y: number,
+      arriveFrom: ExitDirection | null,
+      prevScene: SceneData | null
+    ): Promise<SceneData> => {
+      const id = `s${x}_${y}`;
+      const cached = scenesRef.current.get(id);
+      if (cached) return Promise.resolve(cached);
+      if (!canGenerateRef.current) {
+        return Promise.reject(new Error("The path ends here."));
+      }
+      const pending = screenPromises.current.get(id);
+      if (pending) return pending;
+
+      // Claim before POST so concurrent screen gens each get a distinct room (or none).
+      const claimedRoom = claimNextRoom(placedRoomsRef.current);
+      const unplacedRooms = claimedRoom !== null ? [claimedRoom] : [];
+
+      const p = postStaged<{ scene: SceneData }>("/api/screen", {
+        bible: theBible,
+        x,
+        y,
+        arriveFrom,
+        ...prevScreenPayload(prevScene),
+        unplacedRooms,
+      }, id === ORIGIN_ID ? "first district" : `district ${id}`).then(({ scene: s }) => {
+        scenesRef.current.set(s.id, s);
+        addCalls(GEN_CALL_COST.screen);
+        setScreensDreamed((n) => n + 1);
+        saveScene(s);
+        warmSceneImages(s);
+        const cell = streetCellFromScene(s);
+        if (cell) {
+          setKnownStreets((prev) => mergeKnownCell(prev, cell));
+        }
+        let roomPlacedOnScreen = false;
+        for (const h of s.hotspots) {
+          if (h.kind === "building" && typeof h.clueIndex === "number") {
+            placedRoomsRef.current.add(h.clueIndex);
+            roomPlacedOnScreen = true;
+            prefetchInterior(theBible, h, s.id);
+          }
+        }
+        // Vision missed the reserved room — release so a later screen can place it.
+        if (claimedRoom !== null && !roomPlacedOnScreen) {
+          placedRoomsRef.current.delete(claimedRoom);
+        }
+        return s;
+      });
+      p.catch(() => {
+        screenPromises.current.delete(id);
+        if (claimedRoom !== null) {
+          placedRoomsRef.current.delete(claimedRoom);
+        }
+      });
+      screenPromises.current.set(id, p);
+      return p;
+    },
+    [addCalls, prefetchInterior, saveScene]
+  );
+
+  const resetRunState = useCallback(() => {
+    scenesRef.current = new Map();
+    interiorPromises.current = new Map();
+    screenPromises.current = new Map();
+    placedRoomsRef.current = new Set();
+    voiceCache.current = new Map();
+    dialogueCache.current = new Map();
+    finalePromise.current = null;
+    defeatFinalePromise.current = null;
+    savedFinalesRef.current = {};
+    setScene(null);
+    setSprite(null);
+    setDialogue(null);
+    setPremise(null);
+    setBible(null);
+    setCluesFound([false, false, false]);
+    setHeat(0);
+    setFinale(null);
+    setFinaleLoading(false);
+    setGenCalls(0);
+    setInteriorsReady(0);
+    setInventory([]);
+    setAgentSessions({});
+    agentPromises.current = new Map();
+    setWandering(null);
+    setPendingExplore(null);
+    setAssetLoading(null);
+    setSpawn(null);
+    setShowVision(false);
+    setScreensDreamed(0);
+    setPlayerPos(null);
+    setKnownStreets([]);
+    setWalkedStreets([]);
+    setSecondsLeft(SESSION_TIME_LIMIT_SEC);
+    lowTimeWarnedRef.current = false;
+  }, []);
+
+  /** Populate refs and state from `GET /api/games/[id]`. */
+  const hydrateLoadedGame = useCallback((game: FullGameResponse) => {
+    gameIdRef.current = game.id;
+    canGenerateRef.current = game.isOwner;
+    savedFinalesRef.current = game.finales;
+    setPremise(game.premise);
+    setBible(game.bible);
+    setQuestHook(game.bible.story.goal);
+
+    const streetCoords = streetCoordKeys(game.scenes);
+    const map = new Map<string, SceneData>();
+    for (const s of game.scenes) {
+      const repaired = repairLoadedStreetEdges(s, streetCoords);
+      const scene: SceneData =
+        repaired !== s.edges ? { ...s, edges: repaired } : s;
+      map.set(scene.id, scene);
+      warmSceneImages(scene);
+    }
+    scenesRef.current = map;
+    placedRoomsRef.current = rebuildPlacedRooms(game.scenes);
+
+    const streetCount = game.scenes.filter((s) => s.kind === "street").length;
+    const interiorCount = game.scenes.filter((s) => s.kind === "interior").length;
+    setScreensDreamed(streetCount);
+    setInteriorsReady(interiorCount);
+    setGenCalls(game.genCalls);
+    setKnownStreets(streetsFromScenes(game.scenes));
+    setWalkedStreets([]);
+
+    if (game.finales.victory) {
+      finalePromise.current = Promise.resolve(game.finales.victory);
+    }
+    if (game.finales.defeat) {
+      defeatFinalePromise.current = Promise.resolve(game.finales.defeat);
+    }
+  }, []);
+
+  const startSprite = useCallback(
+    (chosen: Premise, origin: SceneData, existingUrl: string | null) => {
+      if (existingUrl) {
+        chromaKeySprite(existingUrl).then(setSprite).catch(() => {});
+        return;
+      }
+      if (!canGenerateRef.current) return;
+      postStaged<{ sprite: string }>(
+        "/api/sprite",
+        { premise: chosen, ...spriteReferencePayload(origin.image) },
+        "operator sprite"
+      )
+        .then(({ sprite: raw }) => {
+          addCalls(GEN_CALL_COST.sprite);
+          saveSprite(raw);
+          return chromaKeySprite(raw);
+        })
+        .then(setSprite)
+        .catch(() => {});
+    },
+    [addCalls, saveSprite]
+  );
+
+  const startFinales = useCallback(
+    (theBible: GameBible) => {
+      if (!canGenerateRef.current) return;
+      if (!savedFinalesRef.current.victory) {
+        finalePromise.current = post<{ finale: FinaleData }>("/api/finale", {
+          bible: theBible,
+          outcome: "victory",
+        })
+          .then(({ finale: f }) => {
+            addCalls(GEN_CALL_COST.finale);
+            saveFinale("victory", f);
+            fetchVoice(
+              f.resolution,
+              NARRATOR_VOICE,
+              NARRATOR_PARAMS.pace,
+              NARRATOR_PARAMS.temperature
+            );
+            return f;
+          })
+          .catch(() => null);
+      }
+      if (!savedFinalesRef.current.defeat) {
+        defeatFinalePromise.current = post<{ finale: FinaleData }>("/api/finale", {
+          bible: theBible,
+          outcome: "defeat",
+        })
+          .then(({ finale: f }) => {
+            addCalls(GEN_CALL_COST.finale);
+            saveFinale("defeat", f);
+            return f;
+          })
+          .catch(() => null);
+      }
+    },
+    [addCalls, fetchVoice, saveFinale]
+  );
+
+  /** Paint origin, sprite, neighbors, and finales for a newly created game row. */
+  const bootWorld = useCallback(
+    async (theBible: GameBible, chosen: Premise, spriteUrl: string | null) => {
+      setBootStatus("Painting the first screen… then teaching the engine to see it…");
+      const origin =
+        scenesRef.current.get(ORIGIN_ID) ??
+        (await ensureScreen(theBible, 0, 0, null, null));
+      setSpawn(null);
+      await ensureSceneReady(origin);
+      showScene(origin);
+      setSecondsLeft(SESSION_TIME_LIMIT_SEC);
+      lowTimeWarnedRef.current = false;
+      setPhase("playing");
+      startSprite(chosen, origin, spriteUrl);
+      startFinales(theBible);
+    },
+    [ensureSceneReady, ensureScreen, showScene, startFinales, startSprite]
+  );
+
+  /** Fetch a saved game and enter play (or resume boot for incomplete owner games). */
+  const loadGame = useCallback(
+    async (id: string) => {
+      resetRunState();
+      setPhase("booting");
+      setError(null);
+      setBootStatus("Loading your world…");
+      setConsoleSince(beginBoot(id));
+      try {
+        const game = await clientStage(
+          startGroup("loading world"),
+          "fetching world + saved scenes",
+          "supabase · games + game_scenes",
+          () => request<FullGameResponse>(`/api/games/${id}`),
+          (g) => `${g.scenes.length} saved scene(s)`
+        );
+        hydrateLoadedGame(game);
+        setViewer(!game.isOwner);
+        if (game.isOwner) {
+          // Bring the crew online in parallel with the art.
+          game.bible.npcs.slice(0, 3).forEach((_, i) => provisionAgent(game.bible, game.id, i));
+        } else {
+          // Watch mode: mirror this game's existing crew sessions, read-only.
+          fetch(`/api/watch/${game.id}/sessions`)
+            .then((r) => r.json())
+            .then(({ sessions }: { sessions: WatchSessionInfo[] }) => {
+              setWatchSessions(sessions ?? []);
+              setAgentSessions(
+                Object.fromEntries(
+                  (sessions ?? []).map((s) => [
+                    s.districtId,
+                    {
+                      sessionId: s.sessionId,
+                      gameId: game.id,
+                      npcName: s.npcName,
+                      created: false,
+                      pendingApproval: null,
+                      agentType: s.agentType,
+                      mcpServers: [],
+                    },
+                  ])
+                )
+              );
+            })
+            .catch(() => {});
+        }
+
+        const origin = scenesRef.current.get(ORIGIN_ID);
+        if (origin) {
+          await ensureSceneReady(origin);
+          showScene(origin);
+          setSecondsLeft(SESSION_TIME_LIMIT_SEC);
+          lowTimeWarnedRef.current = false;
+          setPhase("playing");
+          startSprite(game.premise, origin, game.spriteUrl);
+          if (game.isOwner) {
+            startFinales(game.bible);
+          }
+          return;
+        }
+
+        if (game.isOwner) {
+          await bootWorld(game.bible, game.premise, game.spriteUrl);
+          return;
+        }
+
+        throw new Error("This world has not been built yet.");
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to load world.");
+        router.push("/");
+      }
+    },
+    [bootWorld, ensureSceneReady, hydrateLoadedGame, provisionAgent, resetRunState, router, showScene, startFinales, startSprite]
+  );
+
+  /** Create flow step 1: bible + game row, then redirect to `/play/[id]` for boot. */
+  const beginCreate = useCallback(
+    async (idea: string) => {
+      resetRunState();
+      setPhase("booting");
+      setError(null);
+      setBootStatus("Writing your game's bible…");
+      canGenerateRef.current = true;
+
+      try {
+        setConsoleSince(beginBoot("pending"));
+        const group = startGroup("world bible");
+        const { bible: theBible } = await postStaged<{ bible: GameBible }>(
+          "/api/universe",
+          { idea, crew: initialCrew },
+          { id: group }
+        );
+        const firstLine =
+          idea.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? "";
+        theBible.title =
+          firstLine.length === 0
+            ? "Untitled world"
+            : firstLine.length <= MAX_GAME_TITLE_LENGTH
+              ? firstLine
+              : `${firstLine.slice(0, MAX_GAME_TITLE_LENGTH - 1)}…`;
+        const chosen: Premise = {
+          id: "custom",
+          title: theBible.title,
+          tagline: "",
+          setup: theBible.protagonist,
+          emoji: "✦",
+          styleBible: theBible.styleBible,
+          goal: theBible.story.goal,
+          goalLabel: "",
+          goalEmoji: "",
+          clockLabel: "",
+        };
+        addCalls(GEN_CALL_COST.universe);
+
+        const created = await clientStage(
+          group,
+          "saving world",
+          "supabase · games.insert",
+          () => post<CreateGameResponse>("/api/games", { idea, bible: theBible, premise: chosen }),
+          (g) => g.id
+        );
+        endGroup(group, "done");
+        gameIdRef.current = created.id;
+        router.replace(`/play/${created.id}`);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "World generation failed.");
+        router.push("/");
+      }
+    },
+    [addCalls, initialCrew, resetRunState, router]
+  );
+
+  useEffect(() => {
+    if (mode === "load" && routeGameId && !bootStartedRef.current) {
+      bootStartedRef.current = true;
+      loadGame(routeGameId);
+    }
+  }, [mode, routeGameId, loadGame]);
+
+  useEffect(() => {
+    if (mode === "create" && initialIdea && !createStartedRef.current) {
+      createStartedRef.current = true;
+      beginCreate(initialIdea);
+    }
+  }, [mode, initialIdea, beginCreate]);
+
+  const onInteract = useCallback(
+    async (h: Hotspot) => {
+      if (!premise || !scene) return;
+      if (secondsLeft <= 0 || finale || finaleLoading) return;
+
+      if (h.kind === "exit") {
+        stopVoice();
+        setDialogue(null);
+        const parent = scenesRef.current.get(scene.parentId ?? ORIGIN_ID);
+        if (parent) {
+          setSpawn(null);
+          await ensureSceneReady(parent, parent.title);
+          showScene(parent);
+        }
+        return;
+      }
+
+      if (h.kind === "item" && h.itemName) {
+        playSfx("pickup");
+        posthog.capture("item_collected", { item_name: h.itemName, scene_id: scene.id });
+        setInventory((inv) => (inv.includes(h.itemName!) ? inv : [...inv, h.itemName!]));
+        const updated = {
+          ...scene,
+          hotspots: scene.hotspots.filter((x) => x.id !== h.id),
+        };
+        scenesRef.current.set(updated.id, updated);
+        setScene(updated);
+        setAmbient(`Picked up: ${h.itemName}`);
+        setTimeout(() => setAmbient(null), 3500);
+        return;
+      }
+
+      if (h.kind === "action") {
+        // An item-granting action gets the pickup chime; a plain action
+        // (drawing water, ringing a bell) still gets a click for feedback.
+        playSfx(h.grantsItem ? "pickup" : "click");
+        if (h.grantsItem) {
+          const item = h.grantsItem;
+          posthog.capture("item_collected", { item_name: item, scene_id: scene.id });
+          setInventory((inv) => (inv.includes(item) ? inv : [...inv, item]));
+        }
+        const drawn = h.suspicion ?? 0;
+        if (drawn > 0) setHeat((v) => Math.min(100, v + drawn));
+        const outcomeLine = h.outcome
+          ? h.grantsItem
+            ? `${h.outcome} (+ ${h.grantsItem})`
+            : h.outcome
+          : `${h.name} — done.`;
+        setAmbient(drawn > 0 && h.risk ? `${outcomeLine} — ${h.risk}` : outcomeLine);
+        setTimeout(() => setAmbient(null), 4500);
+        const updated = {
+          ...scene,
+          hotspots: scene.hotspots.filter((x) => x.id !== h.id),
+        };
+        scenesRef.current.set(updated.id, updated);
+        if (h.leadsOutside) {
+          const parent = scenesRef.current.get(scene.parentId ?? ORIGIN_ID);
+          if (parent) {
+            setSpawn(null);
+            await ensureSceneReady(parent, parent.title);
+            showScene(parent);
+            return;
+          }
+        }
+        setScene(updated);
+        return;
+      }
+
+      if (h.kind === "npc" && scene.npc && viewer) {
+        setAmbient(`Watching live — only the host can talk to ${scene.npc.name}. Press \` to see what the crew is doing.`);
+        setTimeout(() => setAmbient(null), 4000);
+        return;
+      }
+      if (h.kind === "npc" && scene.npc) {
+        const opening = scene.npc.opening;
+        const params = voiceParams("wary");
+        posthog.capture("npc_conversation_started", { npc_name: scene.npc.name, scene_id: scene.id });
+        if (voiceOnRef.current) {
+          setDialogue({
+            npc: scene.npc,
+            history: [],
+            options: [],
+            thinking: true,
+          });
+          await fetchVoice(opening, scene.npc.voice, params.pace, params.temperature);
+        }
+        setDialogue({
+          npc: scene.npc,
+          history: [{ speaker: "npc", text: opening }],
+          options: OPENING_OPTIONS,
+          thinking: false,
+        });
+        void speak(opening, scene.npc.voice, params.pace, params.temperature);
+        return;
+      }
+
+      if (h.kind === "building" && bible) {
+        if (typeof h.clueIndex !== "number") {
+          setAmbient(`${h.name} — the door is bolted shut.`);
+          setTimeout(() => setAmbient(null), 3000);
+          return;
+        }
+        setEntering(h.name);
+        try {
+          let interior = scenesRef.current.get(`b${h.clueIndex}`);
+          if (!interior) {
+            if (!canGenerateRef.current) {
+              setAmbient(`${h.name} — the door won't budge.`);
+              setTimeout(() => setAmbient(null), 3000);
+              return;
+            }
+            prefetchInterior(bible, h, scene.id);
+            interior = await interiorPromises.current.get(`room${h.clueIndex}`);
+          }
+          if (interior) {
+            setSpawn(null);
+            await ensureSceneReady(interior);
+            showScene(interior);
+            // The crew member's TrueForge session (usually provisioned at boot).
+            const gameId = gameIdRef.current;
+            if (gameId && interior.npc && typeof h.clueIndex === "number") {
+              provisionAgent(bible, gameId, h.clueIndex);
+            }
+          }
+        } catch {
+          setError(`Couldn't step into ${h.name}. Try again.`);
+          setTimeout(() => setError(null), 4000);
+        } finally {
+          setEntering(null);
+        }
+      }
+    },
+    [provisionAgent, viewer, bible, ensureSceneReady, fetchVoice, prefetchInterior, premise, scene, showScene, speak, stopVoice, secondsLeft, finale, finaleLoading]
+  );
+
+  /** Walking off an open edge — confirm before generating; walls for visitors without a neighbor. */
+  const onExitEdge = useCallback(
+    async (dir: ExitDirection) => {
+      if (!bible || !scene?.coord) return;
+      if (secondsLeft <= 0 || finale || finaleLoading) return;
+      const { dx, dy, spawn: arriveAt, word } = EDGE_META[dir];
+      const nx = scene.coord.x + dx;
+      const ny = scene.coord.y + dy;
+      const neighborId = `s${nx}_${ny}`;
+      const next = scenesRef.current.get(neighborId) ?? null;
+      if (!next) {
+        if (!canGenerateRef.current) return;
+        setPendingExplore({ dir, word, nx, ny, arriveAt });
+        return;
+      }
+      setSpawn(arriveAt);
+      await ensureSceneReady(next, `Heading ${word}`);
+      showScene(next);
+    },
+    [bible, ensureSceneReady, scene, showScene, secondsLeft, finale, finaleLoading]
+  );
+
+  /** Owner accepted painting the unexplored neighbor. */
+  const confirmExplore = useCallback(async () => {
+    const pending = pendingExplore;
+    if (!pending || !bible || !scene) return;
+    if (secondsLeft <= 0 || finale || finaleLoading) return;
+    setPendingExplore(null);
+    setWandering(pending.word);
+    posthog.capture("new_area_explored", { direction: pending.word, x: pending.nx, y: pending.ny });
+    try {
+      const next = await ensureScreen(bible, pending.nx, pending.ny, pending.dir, scene);
+      setSpawn(pending.arriveAt);
+      await ensureSceneReady(next);
+      showScene(next);
+    } catch {
+      setError("The path ahead dissolved into mist. Try again.");
+      setTimeout(() => setError(null), 4000);
+    } finally {
+      setWandering(null);
+    }
+  }, [bible, ensureSceneReady, ensureScreen, pendingExplore, scene, showScene, secondsLeft, finale, finaleLoading]);
+
+  /** Owner declined — stay on the current screen. */
+  const cancelExplore = useCallback(() => {
+    setPendingExplore(null);
+  }, []);
+
+  const onSay = useCallback(
+    async (line: string) => {
+      if (!bible || !scene?.npc || !dialogue) return;
+      if (secondsLeft <= 0 || finale || finaleLoading) return;
+      const history: DialogueTurn[] = [...dialogue.history, { speaker: "player", text: line }];
+      setDialogue({ ...dialogue, history, options: [], thinking: true });
+      const clueIndex = scene.clueIndex;
+      const hasClue = typeof clueIndex === "number";
+      if (!hasClue) return;
+      try {
+        const isFirstTurn = history.filter((t) => t.speaker === "player").length === 1;
+        const cached =
+          isFirstTurn && heat < 60
+            ? dialogueCache.current.get(`${scene.id}|${line}`)
+            : undefined;
+        let reply: DialogueResponse;
+        if (cached) {
+          reply = await cached;
+        } else {
+          reply = await post<DialogueResponse>("/api/dialogue", {
+            bible,
+            npcIndex: clueIndex,
+            history: dialogue.history,
+            playerLine: line,
+            clueFound: cluesFound[clueIndex],
+            exchanges: history.filter((t) => t.speaker === "player").length,
+            inventory,
+            heat,
+          });
+        }
+        const offense = reply.offense ?? "none";
+        if (offense !== "none") {
+          setHeat((v) => Math.min(100, v + OFFENSE_HEAT[offense]));
+          setAmbient(
+            offense === "grave"
+              ? `${dialogue.npc.name} turns cold. ${bible.heatLabel} spreads through the street.`
+              : `That stung. ${bible.heatLabel} rises.`
+          );
+          setTimeout(() => setAmbient(null), 4500);
+        }
+        if (reply.questUpdate?.trim()) setQuestHook(reply.questUpdate.trim());
+        if (reply.clueRevealed && hasClue && !cluesFound[clueIndex]) {
+          posthog.capture("clue_revealed", { clue_index: clueIndex, scene_id: scene.id });
+          setCluesFound((prev) => {
+            const next = [...prev];
+            next[clueIndex] = true;
+            const n = next.filter(Boolean).length;
+            setAmbient(
+              n >= next.length
+                ? "Final clue uncovered — the truth is within reach."
+                : `Clue uncovered (${n}/${next.length}).`
+            );
+            return next;
+          });
+        }
+        const params = voiceParams(reply.mood);
+        if (voiceOnRef.current) {
+          await fetchVoice(
+            reply.line,
+            dialogue.npc.voice,
+            params.pace,
+            params.temperature
+          );
+        }
+        setDialogue({
+          npc: dialogue.npc,
+          history: [...history, { speaker: "npc", text: reply.line }],
+          options: reply.done ? [] : reply.options,
+          thinking: false,
+          mood: reply.mood,
+        });
+        void speak(
+          reply.line,
+          dialogue.npc.voice,
+          params.pace,
+          params.temperature
+        );
+      } catch {
+        setDialogue({
+          ...dialogue,
+          history,
+          options: OPENING_OPTIONS,
+          thinking: false,
+        });
+      }
+    },
+    [bible, scene, dialogue, heat, cluesFound, speak, fetchVoice, addCalls, inventory, secondsLeft, finale, finaleLoading]
+  );
+
+  const allCluesFound = bible ? cluesFound.every(Boolean) : false;
+
+  const runFinale = useCallback(
+    async (outcome: "victory" | "defeat" = "victory", reason?: string) => {
+      if (!bible || finaleLoading || finale) return;
+      stopVoice();
+      setDialogue(null);
+      setFinaleLoading(true);
+      posthog.capture("game_ended", {
+        outcome,
+        reason: reason ?? null,
+        clues_found: cluesFound.filter(Boolean).length,
+        total_clues: cluesFound.length,
+        gen_calls: genCalls,
+        screens_dreamed: screensDreamed,
+      });
+      try {
+        let f: FinaleData | null = savedFinalesRef.current[outcome] ?? null;
+        if (!f && outcome === "victory" && finalePromise.current) {
+          f = await finalePromise.current;
+        }
+        if (!f && outcome === "defeat" && defeatFinalePromise.current) {
+          f = await defeatFinalePromise.current;
+        }
+        if (!f && canGenerateRef.current) {
+          const res = await post<{ finale: FinaleData }>("/api/finale", {
+            bible,
+            outcome,
+            reason,
+          });
+          f = res.finale;
+          addCalls(GEN_CALL_COST.finale);
+          saveFinale(outcome, f);
+        }
+        if (!f) throw new Error("Finale unavailable.");
+        if (voiceOnRef.current) {
+          await fetchVoice(
+            f.resolution,
+            NARRATOR_VOICE,
+            NARRATOR_PARAMS.pace,
+            NARRATOR_PARAMS.temperature
+          );
+        }
+        setFinale({ ...f, outcome: f.outcome ?? outcome });
+        void speak(
+          f.resolution,
+          NARRATOR_VOICE,
+          NARRATOR_PARAMS.pace,
+          NARRATOR_PARAMS.temperature
+        );
+      } catch {
+        setError("The ending slipped away. Try again.");
+        setTimeout(() => setError(null), 4000);
+      } finally {
+        setFinaleLoading(false);
+      }
+    },
+    [bible, finale, finaleLoading, speak, fetchVoice, stopVoice, addCalls, saveFinale, cluesFound, genCalls, screensDreamed]
+  );
+
+  useEffect(() => {
+    if (heat >= 100 && bible && !finale && !finaleLoading) {
+      const hard = bible.failStates.find((f) => f.kind === "hard");
+      runFinale("defeat", hard?.trigger ?? `the ${bible.heatLabel} meter reached 100`);
+    }
+  }, [heat, bible, finale, finaleLoading, runFinale]);
+
+  /** Pause the session clock while generation/loading overlays block movement. */
+  const timerPaused =
+    entering !== null ||
+    wandering !== null ||
+    pendingExplore !== null ||
+    assetLoading !== null ||
+    finale !== null ||
+    finaleLoading;
+
+  /** Tick the session clock while the player can move freely. */
+  useEffect(() => {
+    if (phase !== "playing" || timerPaused) return;
+    const id = setInterval(() => {
+      setSecondsLeft((s) => (s <= 1 ? 0 : s - 1));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [phase, timerPaused]);
+
+  /** One low-time warning per session. */
+  useEffect(() => {
+    if (secondsLeft === 60 && phase === "playing" && !lowTimeWarnedRef.current) {
+      lowTimeWarnedRef.current = true;
+      const note = "Time is running out…";
+      setAmbient(note);
+      setTimeout(() => setAmbient((a) => (a === note ? null : a)), 4500);
+    }
+  }, [secondsLeft, phase]);
+
+  /** Session over — trigger defeat when the wall clock hits zero. */
+  useEffect(() => {
+    if (secondsLeft === 0 && bible && !finale && !finaleLoading) {
+      runFinale("defeat", "time ran out");
+    }
+  }, [secondsLeft, bible, finale, finaleLoading, runFinale]);
+
+  const closeDialogue = useCallback(() => {
+    stopVoice();
+    setDialogue(null);
+  }, [stopVoice]);
+
+  const leaveWorld = useCallback(() => {
+    stopVoice();
+    router.push("/");
+  }, [stopVoice, router]);
+
+  const onPlayerPosition = useCallback((p: PlayerState) => {
+    setPlayerPos({ x: p.x, y: p.y });
+  }, []);
+
+  useEffect(() => stopVoice, [stopVoice]);
+
+  // Global keyboard: backtick toggles SystemView
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const typing = ["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName ?? "");
+      if (e.key === "`" && phase === "playing" && !typing) {
+        e.preventDefault();
+        setSystemViewOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [phase]);
+
+  if (phase === "booting" || !scene || !premise) {
+    return (
+      <div className="flex min-h-dvh flex-col items-center justify-center gap-5 bg-[#020308] px-4 py-8">
+        <div className="text-center">
+          <p className="font-mono text-[10px] uppercase tracking-[0.35em] text-cyan-300/70">Threshold</p>
+          <h2 className="mt-1 font-display text-3xl font-extrabold text-white">
+            {premise?.title ?? bible?.title ?? "Building your world"}
+          </h2>
+        </div>
+        <GenerationConsole variant="full" since={consoleSince} subtitle={bootStatus} />
+        {error && (
+          <Alert variant="destructive" className="w-full max-w-3xl">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+      </div>
+    );
+  }
+
+  const minimapCoord =
+    scene.kind === "street" && scene.coord
+      ? scene.coord
+      : scene.kind === "interior" && scene.parentId
+        ? (scenesRef.current.get(scene.parentId)?.coord ?? null)
+        : null;
+
+  return (
+    <div className="relative h-dvh w-full overflow-hidden bg-ink">
+      <RotateToLandscapePrompt visible={phase === "playing"} />
+
+      <GameCanvas
+        scene={scene}
+        sprite={sprite}
+        paused={
+          dialogue !== null ||
+          entering !== null ||
+          wandering !== null ||
+          pendingExplore !== null ||
+          assetLoading !== null
+        }
+        onInteract={onInteract}
+        spawn={spawn}
+        onExitEdge={onExitEdge}
+        onPosition={onPlayerPosition}
+        onNearChange={setNearHotspot}
+        touchInputRef={touchInputRef}
+        touchControls={touchControls}
+        showVision={showVision}
+      />
+
+      <MobileControls
+        touchInputRef={touchInputRef}
+        nearHotspot={nearHotspot}
+        paused={
+          dialogue !== null ||
+          entering !== null ||
+          wandering !== null ||
+          pendingExplore !== null ||
+          assetLoading !== null
+        }
+        onInteract={onInteract}
+      />
+
+      <WorldHud
+        headerAction={!viewer && gameIdRef.current ? <SharePopover gameId={gameIdRef.current} /> : undefined}
+        compact={touchControls}
+        premise={premise}
+        scene={scene}
+        questHook={questHook}
+        secondsLeft={secondsLeft}
+        inventory={inventory}
+        bible={bible}
+        cluesFound={cluesFound}
+        allCluesFound={allCluesFound}
+        finale={finale}
+        finaleLoading={finaleLoading}
+        heat={heat}
+        showVision={showVision}
+        onToggleVision={() => setShowVision((v) => !v)}
+        musicOn={musicOn}
+        onToggleMusic={() => setMusicOn((m) => !m)}
+        voiceOn={voiceOn}
+        onToggleVoice={() => setVoiceOn((v) => !v)}
+        onLeaveWorld={leaveWorld}
+        onRunFinale={(outcome) => runFinale(outcome)}
+        dialogue={dialogue}
+        knownStreets={knownStreets}
+        walkedStreets={walkedStreets}
+        minimapCoord={minimapCoord}
+        playerPos={playerPos}
+      />
+
+      <AnimatePresence>
+        {ambient && (
+          <motion.p
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.5 }}
+            className="pointer-events-none absolute inset-x-0 top-24 z-10 mx-auto w-fit max-w-[80%] rounded-full bg-black/55 px-4 py-2 text-center text-sm font-medium text-white backdrop-blur-sm"
+          >
+            {ambient}
+          </motion.p>
+        )}
+      </AnimatePresence>
+
+      {!dialogue && !touchControls && (
+        <div className="pointer-events-none absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-full bg-black/55 px-4 py-2 text-xs font-semibold text-white/90 backdrop-blur-sm">
+          WASD / arrows — move · E — enter / talk · ` — System View
+        </div>
+      )}
+
+      {!dialogue && !finale && !touchControls && (
+        <Card className="pointer-events-none absolute bottom-4 right-4 z-10 flex-row items-center gap-2 gap-y-0 px-3 py-2"
+          title="Every screen is painted, then the model traces borders over its own frame and reads both images back into the game"
+        >
+          <Zap size={11} strokeWidth={2.5} className="text-main" />
+          <span className="text-[11px] font-semibold tabular-nums text-foreground">
+            {genCalls} generations
+          </span>
+          <span className="h-3 w-px bg-border" />
+          <Compass size={11} strokeWidth={2.5} className="text-main" />
+          <span className="text-[11px] font-semibold tabular-nums text-foreground">
+            {screensDreamed} screens
+          </span>
+          <span className="h-3 w-px bg-border" />
+          <DoorOpen size={11} strokeWidth={2.5} className="text-main" />
+          <span className="text-[11px] font-semibold tabular-nums text-foreground">
+            rooms {interiorsReady}/3
+          </span>
+        </Card>
+      )}
+
+      <Dialog open={!!assetLoading}>
+        <DialogContent className="[&>button]:hidden" onPointerDownOutside={(e) => e.preventDefault()}>
+          <DialogHeader>
+            <DialogTitle className="text-center font-display text-xl">
+              {assetLoading}
+            </DialogTitle>
+            <LoadingBlock label="" detail="stepping through…" className="mt-2" />
+          </DialogHeader>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog
+        open={!!pendingExplore}
+        onOpenChange={(open) => !open && cancelExplore()}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Explore {pendingExplore?.word}?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Painting a new screen uses API credits.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Stay</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmExplore}>
+              Generate
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <Dialog open={!!wandering}>
+        <DialogContent className="[&>button]:hidden" onPointerDownOutside={(e) => e.preventDefault()}>
+          <DialogHeader>
+            <DialogTitle className="text-center font-display text-xl">
+              Wandering {wandering}…
+            </DialogTitle>
+            <LoadingBlock
+              label=""
+              detail="painting the next screen · tracing it · reading it"
+              className="mt-2"
+            />
+          </DialogHeader>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!entering}>
+        <DialogContent className="[&>button]:hidden" onPointerDownOutside={(e) => e.preventDefault()}>
+          <DialogHeader>
+            <DialogTitle className="text-center font-display text-xl">
+              {entering}
+            </DialogTitle>
+            <LoadingBlock label="" detail="stepping inside…" className="mt-2" />
+          </DialogHeader>
+        </DialogContent>
+      </Dialog>
+
+      <AnimatePresence>
+        {finale && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.6 }}
+            className="absolute inset-0 z-40 overflow-y-auto bg-ink"
+          >
+            <img
+              src={finale.image}
+              alt=""
+              className="absolute inset-0 h-full w-full object-cover opacity-60"
+            />
+            <div className="absolute inset-0 bg-gradient-to-t from-ink via-ink/40 to-transparent" />
+            <div className="relative flex min-h-full flex-col items-center justify-end px-6 pb-14 text-center">
+              <motion.div
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.6, delay: 0.4 }}
+                className="max-w-xl"
+              >
+                <p className="text-xs font-bold uppercase tracking-[0.3em] text-primary2">
+                  {finale.outcome === "defeat" ? "The fall" : "The truth"}
+                </p>
+                <h2 className="mt-2 font-display text-4xl font-extrabold text-white">
+                  {finale.title}
+                </h2>
+                <p className="mt-4 text-base font-medium leading-relaxed text-white/90">
+                  {finale.resolution}
+                </p>
+                <Button className="mt-8" size="lg" onClick={leaveWorld}>
+                  Back to gallery
+                </Button>
+              </motion.div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Live Ops Terminal — the crew member's workstation screen */}
+      {scene.kind === "interior" && agentSessions[scene.id] && (
+        <div className="pointer-events-none absolute bottom-28 left-3 top-20 z-30 hidden sm:block">
+          <OpsTerminal
+            sessionId={agentSessions[scene.id].sessionId}
+            agentName={agentSessions[scene.id].npcName}
+            typeName={agentSessions[scene.id].agentType.name}
+            mcpServers={agentSessions[scene.id].mcpServers}
+            memoryCount={agentSessions[scene.id].memoryCount}
+            trueforgeUrl={agentSessions[scene.id].links?.session}
+          />
+        </div>
+      )}
+
+      {/* Generation Console dock — visible while anything is being generated */}
+      <div className="pointer-events-none absolute bottom-3 right-3 z-30">
+        <GenerationConsole variant="dock" />
+      </div>
+
+      {/* ThresholdCard — approval gate */}
+      {pendingApproval && (
+        <ThresholdCard
+          key={pendingApproval.payload.approvalId}
+          payload={pendingApproval.payload}
+          onDecision={handleApprovalDecision}
+          loading={approvalLoading}
+        />
+      )}
+
+      {/* Follow the room's session for decisions made in TrueForge's own UI */}
+      {viewer && gameIdRef.current && <WatchFeed gameId={gameIdRef.current} sessions={watchSessions} />}
+      {viewer && <WatchBanner />}
+      {viewer && systemViewOpen && (
+        <WatchSystemView sessions={watchSessions} onClose={() => setSystemViewOpen(false)} />
+      )}
+
+      {!viewer && agentSessions[scene.id] && (
+        <SessionWatcher
+          key={agentSessions[scene.id].sessionId}
+          sessionId={agentSessions[scene.id].sessionId}
+          agentTypeId={agentSessions[scene.id].agentType.id}
+          agentLabel={`${agentSessions[scene.id].npcName} (${agentSessions[scene.id].agentType.name})`}
+          onExternalDecision={(decision) => {
+            // Same session, decided in the embedded TrueForge UI: close the card
+            // and count it (the panel shows the full arguments — a reviewed decision).
+            setPendingApproval(null);
+            if (decision === "approved") setHeat((v) => Math.min(100, v + 5));
+            setAmbient(`${decision === "approved" ? "Approved" : "Denied"} in TrueForge's UI.`);
+            setTimeout(() => setAmbient(null), 4000);
+          }}
+        />
+      )}
+
+      {/* System View — TrueForge's own UI, embedded, on this room's session */}
+      {!viewer && systemViewOpen &&
+        (agentSessions[scene.id]?.links?.session ? (
+          <SystemViewHost
+            sessionId={agentSessions[scene.id].sessionId}
+            agentName={agentSessions[scene.id].agentName ?? `threshold-${agentSessions[scene.id].agentType.id}`}
+            trueforgeUrl={agentSessions[scene.id].links!.session!}
+            onClose={() => setSystemViewOpen(false)}
+          />
+        ) : (
+          <div className="pointer-events-auto fixed right-3 top-20 z-[70] max-w-xs rounded-lg border border-white/15 bg-black/90 p-3 text-xs text-white/80">
+            System View shows TrueForge&apos;s own UI for a crew member&apos;s live session — step into a
+            crew member&apos;s room first. (` to close)
+          </div>
+        ))}
+
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex justify-center sm:p-4">
+        <AnimatePresence>
+          {dialogue && scene.npc && agentSessions[scene.id] ? (
+            <AgentDialogue
+              key={agentSessions[scene.id].sessionId}
+              npc={dialogue.npc}
+              sessionId={agentSessions[scene.id].sessionId}
+              gameId={agentSessions[scene.id].gameId}
+              agentTypeId={agentSessions[scene.id].agentType.id}
+              agentLabel={`${agentSessions[scene.id].npcName} (${agentSessions[scene.id].agentType.name})`}
+              voiceOn={voiceOn}
+              onToggleVoice={() => setVoiceOn((v) => !v)}
+              onClose={closeDialogue}
+              onApprovalRequired={(payload, resolve) => setPendingApproval({ payload, resolve })}
+              initialPendingApproval={agentSessions[scene.id].pendingApproval}
+              onFindingResolved={() => {
+                setCluesFound((prev) => {
+                  const next = [...prev];
+                  const idx = scene.clueIndex;
+                  if (typeof idx === "number" && !next[idx]) {
+                    next[idx] = true;
+                  }
+                  return next;
+                });
+              }}
+              speak={speak}
+              speaking={speaking}
+            />
+          ) : dialogue && scene.npc ? (
+            <DialogueBox
+              npc={dialogue.npc}
+              history={dialogue.history}
+              options={dialogue.options}
+              thinking={dialogue.thinking}
+              mood={dialogue.mood}
+              speaking={speaking}
+              voiceOn={voiceOn}
+              onToggleVoice={() => setVoiceOn((v) => !v)}
+              onSay={onSay}
+              onClose={closeDialogue}
+            />
+          ) : null}
+        </AnimatePresence>
+      </div>
+
+      <AnimatePresence>
+        {error && phase === "playing" && (
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            className="absolute bottom-16 left-1/2 z-30 w-[min(92%,28rem)] -translate-x-1/2"
+          >
+            <Alert variant="destructive">
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
