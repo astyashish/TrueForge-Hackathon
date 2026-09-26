@@ -41,6 +41,18 @@ npm run dev                  # terminal 2: Threshold on :3000
 
 ---
 
+## Sharing a world (Watch links)
+
+A `localhost` link only opens on your own machine. To share one:
+
+1. Run the game (`start.bat`), open a world.
+2. Double-click **`share.bat`** (or `npm run share`). It builds the app, serves the production build on `:3100`, and opens a Cloudflare quick tunnel to **that port only**. Needs `cloudflared` (`winget install --id Cloudflare.cloudflared`).
+3. Click **Share** (top-right in the world): copy the link or scan the QR code.
+
+Anyone with the link gets **Watch mode**: the live world, read-only, plus a live mirror of that game's real TrueForge sessions (ops terminals, and a read-only System View). It is enforced on the server (`lib/access.ts`, `proxy.ts`): only requests to `localhost` from this machine are the host; everything else can only read that one game and its crew sessions. Visitors cannot talk to the crew, approve anything, generate art or reach TrueForge. TrueForge (`:8790`) and the ops MCP servers (`:8791`) listen on localhost only and are never tunnelled — TrueForge's local mode has no login, so exposing it (or its UI) would give visitors full admin access.
+
+The link works while your laptop is awake and `share.bat` is running; a quick tunnel gets a new random URL each start. "Play together" (visitors with their own avatars and sessions) is not built.
+
 ## The crew
 
 Agent types are data (`lib/agent-types.ts`), not hardcoded districts. Each one has a role, a **real system scope** (TrueForge MCP servers), a **skill pack** (`skills/<id>/SKILL.md`, git-tracked), an **approval policy** and a look for the world generator.
@@ -105,8 +117,8 @@ Create `.env.local` from `.env.example` (`start.bat` does this for you and opens
 | Variable | Description |
 |---|---|
 | `GEMINI_API_KEY` | Google Gemini key (world art + text; also registered as TrueForge's model) |
-| `TEXT_MODEL` | default `gemini-3.5-flash` |
-| `IMAGE_MODEL` | default `gemini-3.1-flash-lite-image` — needs a billed key; the free tier rate-limits hard |
+| `TEXT_MODEL` | default `gemini-2.5-flash` |
+| `IMAGE_MODEL` | default `gemini-2.0-flash-preview-image-generation` — needs a billed key; the free tier rate-limits hard |
 | `SARVAM_API_KEY` | Sarvam AI key for NPC voice (Bulbul v3) |
 | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Supabase project |
 | `TRUEFORGE_SERVER_URL` | default `http://localhost:8790` |
